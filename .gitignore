@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Capturas / scratch
+image.png
+image*.png
+*.wav
+test_*.wav
+
+# IDE
+.vscode/
+.idea/

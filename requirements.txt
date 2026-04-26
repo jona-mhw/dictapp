@@ -1,0 +1,17 @@
+# Requeridas
+pyaudio>=0.2.13
+pyperclip>=1.8.2
+groq>=0.11.0
+pystray>=0.19.5
+Pillow>=10.0.0
+keyboard>=0.13.5
+keyring>=24.0.0
+
+# Opcionales — habilitan backends adicionales
+SpeechRecognition>=3.10.0     # backend Google
+faster-whisper>=1.0.0         # backend Whisper local (offline)
+huggingface_hub>=0.23.0       # descarga de modelos para faster-whisper
+
+# Fallback de audio: si PyAudio falla con -9999 en Windows 11
+sounddevice>=0.4.6
+numpy>=1.24.0
