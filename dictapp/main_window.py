@@ -6,10 +6,11 @@ from tkinter import ttk
 from typing import Callable
 
 from . import audio
-from .audio_sd import SDMeterScanner, SD_AVAILABLE
-from .mic_meter import MultiMicMeter
+from .audio_sd import SDLiveMeter, SD_AVAILABLE
 from .theme import PALETTE
 from .version import APP_NAME, VERSION
+
+VOICE_THRESHOLD = 0.06  # nivel a partir del cual el dot se enciende como "voz detectada"
 
 
 class MainWindow:
@@ -33,8 +34,10 @@ class MainWindow:
     ) -> None:
         self.root = root
         self.config = config
-        self._mic_meter: MultiMicMeter | None = None
-        self._mic_widgets: list[dict] = []  # filas con bar/canvas/label/radio
+        self._mic_meter: SDLiveMeter | None = None
+        self._curated_mics: list[audio.MicDevice] = []
+        self._active_mic_index: int = -1
+        self._level_override = None  # callable que devuelve un nivel 0..1 (durante grabación)
         self._on_toggle_recording = on_toggle_recording
         self._on_change_service = on_change_service
         self._on_change_groq_key = on_change_groq_key
@@ -155,15 +158,34 @@ class MainWindow:
 
         mic_header = ttk.Frame(tab, style="TFrame")
         mic_header.pack(fill=tk.X, padx=10, pady=(0, 0))
-        ttk.Label(mic_header,
-                  text="Micrófono — habla unos segundos; el scanner rota por todos",
+        ttk.Label(mic_header, text="Micrófono",
                   style="Subtitle.TLabel").pack(side=tk.LEFT)
         ttk.Button(mic_header, text="↻", width=3, command=self.refresh_microphones
                    ).pack(side=tk.RIGHT)
 
-        self.mic_list_frame = ttk.Frame(tab, style="TFrame")
-        self.mic_list_frame.pack(fill=tk.X, padx=10, pady=(4, 8))
-        self.mic_var = tk.IntVar(value=int(self.config.get("mic_index", -1)))
+        # fila del mic activo: dot de voz + nombre + barra de nivel
+        self.mic_active_frame = ttk.Frame(tab, style="TFrame")
+        self.mic_active_frame.pack(fill=tk.X, padx=10, pady=(6, 4))
+        self.voice_dot = tk.Canvas(self.mic_active_frame, width=14, height=14,
+                                   bg=PALETTE["bg"], highlightthickness=0)
+        self.voice_dot.pack(side=tk.LEFT)
+        self._draw_voice_dot(False)
+        self.mic_active_label = ttk.Label(self.mic_active_frame, text="(detectando…)",
+                                          style="Subtitle.TLabel")
+        self.mic_active_label.pack(side=tk.LEFT, padx=(8, 8))
+        self.mic_bar = tk.Canvas(self.mic_active_frame, width=160, height=10,
+                                 bg=PALETTE["bg_alt"], highlightthickness=0, bd=0)
+        self.mic_bar.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(0, 0))
+
+        # combobox de alternativas (mics físicos disponibles, curados)
+        alt_row = ttk.Frame(tab, style="TFrame")
+        alt_row.pack(fill=tk.X, padx=10, pady=(2, 8))
+        ttk.Label(alt_row, text="Cambiar:", style="Subtitle.TLabel").pack(side=tk.LEFT)
+        self.mic_combo_var = tk.StringVar()
+        self.mic_combo = ttk.Combobox(alt_row, textvariable=self.mic_combo_var,
+                                      state="readonly", width=44)
+        self.mic_combo.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+        self.mic_combo.bind("<<ComboboxSelected>>", lambda *_: self._on_mic_combo_selected())
         self.refresh_microphones()
 
         ttk.Separator(tab).pack(fill=tk.X, padx=10, pady=10)
@@ -277,13 +299,36 @@ class MainWindow:
         if ok:
             self.hotkey_hint.config(text=f"Atajo: {self.hotkey_var.get().upper()}")
 
-    def _on_mic_selected_radio(self) -> None:
-        idx = int(self.mic_var.get())
-        self._on_change_mic(idx)
-        # marcar visualmente la fila seleccionada
-        for w in self._mic_widgets:
-            sel = (w["index"] == idx)
-            w["name_label"].config(foreground=PALETTE["fg"] if sel else PALETTE["fg_dim"])
+    def _draw_voice_dot(self, on: bool) -> None:
+        self.voice_dot.delete("all")
+        color = PALETTE["ok"] if on else PALETTE["fg_dim"]
+        self.voice_dot.create_oval(2, 2, 12, 12, fill=color, outline="")
+
+    def _on_mic_combo_selected(self) -> None:
+        label = self.mic_combo_var.get()
+        for d in self._curated_mics:
+            if self._mic_label(d) == label:
+                self._set_active_mic(d.index)
+                return
+
+    def _mic_label(self, d: "audio.MicDevice") -> str:
+        tag = "  ★ default" if d.is_default else ""
+        name = d.name if len(d.name) <= 60 else d.name[:57] + "…"
+        return f"{name}{tag}"
+
+    def _set_active_mic(self, index: int) -> None:
+        if index == self._active_mic_index:
+            return
+        self._active_mic_index = index
+        self._on_change_mic(index)
+        # actualizar label del mic activo
+        for d in self._curated_mics:
+            if d.index == index:
+                self.mic_active_label.config(text=d.name)
+                break
+        # reiniciar el meter sobre el nuevo mic
+        self._stop_mic_meter()
+        self._start_mic_meter(index)
 
     def _toggle_compact(self) -> None:
         self._apply_compact(not bool(self.config.get("compact_mode", False)))
@@ -326,125 +371,95 @@ class MainWindow:
         self.root.after(0, lambda: self.service_status_label.config(text=text))
 
     def refresh_microphones(self) -> None:
-        # detener meter previo
         self._stop_mic_meter()
-        # limpiar filas
-        for w in self._mic_widgets:
-            try:
-                w["row"].destroy()
-            except Exception:
-                pass
-        self._mic_widgets.clear()
-
         try:
-            devs = audio.list_input_devices()
+            devs = audio.list_curated_input_devices()
         except Exception as e:
             self.log(f"No se pudo listar micrófonos: {e}")
             return
-
-        configured = int(self.config.get("mic_index", -1))
+        self._curated_mics = devs
         if not devs:
-            ttk.Label(self.mic_list_frame, text="(sin micrófonos detectados)",
-                      style="Subtitle.TLabel").pack(anchor="w", padx=4, pady=4)
+            self.mic_active_label.config(text="(sin micrófonos)")
+            self.mic_combo["values"] = []
             return
 
-        # asegurar que haya una selección válida
-        if configured == -1 or configured not in [d.index for d in devs]:
-            for d in devs:
-                if d.is_default:
-                    self.mic_var.set(d.index)
-                    break
-            else:
-                self.mic_var.set(devs[0].index)
+        # elegir el activo: lo guardado si sigue existiendo, si no el default del sistema
+        configured = int(self.config.get("mic_index", -1))
+        active = next((d for d in devs if d.index == configured), None)
+        if active is None:
+            active = next((d for d in devs if d.is_default), devs[0])
+        self._active_mic_index = active.index
 
-        for d in devs:
-            row = ttk.Frame(self.mic_list_frame, style="TFrame")
-            row.pack(fill=tk.X, pady=2)
-            radio = ttk.Radiobutton(row, value=d.index, variable=self.mic_var,
-                                    command=self._on_mic_selected_radio)
-            radio.pack(side=tk.LEFT)
-            tag = " (default)" if d.is_default else ""
-            display = (d.name[:38] + "…") if len(d.name) > 39 else d.name
-            name_label = ttk.Label(row, text=display + tag, width=42)
-            name_label.pack(side=tk.LEFT, padx=(4, 6))
-            bar = tk.Canvas(row, width=140, height=10,
-                            bg=PALETTE["bg_alt"], highlightthickness=0, bd=0)
-            bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            self._mic_widgets.append({
-                "index": d.index,
-                "row": row,
-                "name_label": name_label,
-                "bar": bar,
-            })
+        # actualizar combobox y label
+        labels = [self._mic_label(d) for d in devs]
+        self.mic_combo["values"] = labels
+        self.mic_combo_var.set(self._mic_label(active))
+        self.mic_active_label.config(text=active.name)
 
-        # destacar la seleccionada
-        selected = int(self.mic_var.get())
-        for w in self._mic_widgets:
-            w["name_label"].config(
-                foreground=PALETTE["fg"] if w["index"] == selected else PALETTE["fg_dim"]
-            )
+        # persistir si cambió (diferido para no chocar con el init del App)
+        if configured != active.index:
+            self.root.after(0, lambda i=active.index: self._on_change_mic(i))
 
-        # arrancar meters: preferir sounddevice si está disponible (más estable en Windows 11)
-        indices = [w["index"] for w in self._mic_widgets]
-        if SD_AVAILABLE:
-            self._mic_meter = SDMeterScanner(indices, log_fn=lambda m: self.log(m))
-        else:
-            self._mic_meter = MultiMicMeter(indices, log_fn=lambda m: self.log(m))
+        self._start_mic_meter(active.index)
+
+    def _start_mic_meter(self, index: int) -> None:
+        if not SD_AVAILABLE:
+            self.log("VU desactivado: sounddevice no disponible.")
+            return
+        self._mic_meter = SDLiveMeter(index, log_fn=lambda m: self.log(m))
         try:
             self._mic_meter.start()
         except Exception as e:
             self.log(f"No se pudo iniciar VU: {e}")
             self._mic_meter = None
             return
+        if self._mic_meter.error:
+            self.log(f"VU: {self._mic_meter.error}")
         self._tick_mic_bars()
-        # chequeo: si en 5s ningún mic dio señal y todos tienen error, avisar
-        self.root.after(5000, self._check_mic_health)
 
     def _tick_mic_bars(self) -> None:
-        if self._mic_meter is None or not self._mic_meter.running:
-            return
-        for w in self._mic_widgets:
-            bar: tk.Canvas = w["bar"]
-            level = self._mic_meter.get_level(w["index"])
-            err = self._mic_meter.get_error(w["index"])
-            bar.delete("all")
-            width = max(1, bar.winfo_width())
-            height = max(1, bar.winfo_height())
-            if err:
-                # rayita roja indicando error
-                bar.create_rectangle(0, 0, width, height, fill=PALETTE["bg_alt"], outline="")
-                bar.create_line(2, height // 2, width - 2, height // 2,
-                                fill=PALETTE["err"], width=1)
-                continue
-            fill_w = int(width * min(1.0, max(0.0, level)))
-            # fondo
-            bar.create_rectangle(0, 0, width, height, fill=PALETTE["bg_alt"], outline="")
-            # color según nivel
-            if level > 0.85:
-                color = PALETTE["err"]
-            elif level > 0.5:
-                color = PALETTE["warn"]
-            elif level > 0.05:
-                color = PALETTE["ok"]
-            else:
-                color = PALETTE["border"]
-            if fill_w > 0:
-                bar.create_rectangle(0, 0, fill_w, height, fill=color, outline="")
-        self.root.after(60, self._tick_mic_bars)
+        # fuente del nivel: override durante grabación, si no el VU meter pasivo
+        level: float = 0.0
+        active = False
+        if self._level_override is not None:
+            try:
+                level = float(self._level_override())
+                active = True
+            except Exception:
+                level = 0.0
+        elif self._mic_meter is not None and self._mic_meter.running:
+            level = self._mic_meter.level
+            active = True
 
-    def _check_mic_health(self) -> None:
-        if self._mic_meter is None:
+        if not active:
             return
-        all_failed = all(self._mic_meter.get_error(w["index"]) is not None
-                         for w in self._mic_widgets)
-        if all_failed and self._mic_widgets:
-            self.log(
-                "⚠ Todos los micrófonos rechazaron la apertura. "
-                "Causa más probable en Windows: permisos de micrófono. "
-                "Ve a Configuración → Privacidad y seguridad → Micrófono → "
-                "activa 'Permitir que las aplicaciones de escritorio accedan al micrófono'. "
-                "También cierra Teams/Zoom/Discord/OBS si están corriendo."
-            )
+
+        bar = self.mic_bar
+        bar.delete("all")
+        width = max(1, bar.winfo_width())
+        height = max(1, bar.winfo_height())
+        bar.create_rectangle(0, 0, width, height, fill=PALETTE["bg_alt"], outline="")
+        if level > 0.85:
+            color = PALETTE["err"]
+        elif level > 0.5:
+            color = PALETTE["warn"]
+        elif level > 0.05:
+            color = PALETTE["ok"]
+        else:
+            color = PALETTE["border"]
+        fill_w = int(width * min(1.0, max(0.0, level)))
+        if fill_w > 0:
+            bar.create_rectangle(0, 0, fill_w, height, fill=color, outline="")
+        self._draw_voice_dot(level >= VOICE_THRESHOLD)
+        self.root.after(50, self._tick_mic_bars)
+
+    def set_level_override(self, getter) -> None:
+        """Activa una fuente de nivel externa (recorder durante grabación).
+        Pasar None para volver al VU meter pasivo."""
+        self._level_override = getter
+        if getter is not None:
+            # asegurar que el tick siga corriendo aunque el SDLiveMeter no esté
+            self.root.after(0, self._tick_mic_bars)
 
     def _stop_mic_meter(self) -> None:
         if self._mic_meter is not None:

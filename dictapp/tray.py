@@ -33,6 +33,29 @@ def _make_image(state: str):
     return img
 
 
+def _make_level_image(level: float):
+    """Icono mientras se graba: anillo rojo + relleno proporcional al nivel."""
+    level = max(0.0, min(1.0, level))
+    img = Image.new("RGB", (64, 64), (30, 31, 36))
+    d = ImageDraw.Draw(img)
+    # anillo exterior rojo (estado grabando)
+    d.ellipse((6, 6, 58, 58), outline=_COLORS["recording"], width=3)
+    # disco interno cuyo radio crece con el nivel
+    base_r = 6
+    extra = int(level * 18)
+    r = base_r + extra
+    cx, cy = 32, 32
+    # color: pasa de naranja → rojo conforme sube
+    if level > 0.7:
+        fill = (255, 80, 80)
+    elif level > 0.3:
+        fill = (245, 165, 85)
+    else:
+        fill = (200, 80, 80)
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=fill)
+    return img
+
+
 class TrayIcon:
     def __init__(
         self,
@@ -63,6 +86,15 @@ class TrayIcon:
             return
         try:
             self.icon.icon = _make_image(state)
+        except Exception:
+            pass
+
+    def set_level(self, level: float) -> None:
+        """Actualiza el icono con un disco proporcional al nivel (estado grabando)."""
+        if not TRAY_AVAILABLE or self.icon is None:
+            return
+        try:
+            self.icon.icon = _make_level_image(level)
         except Exception:
             pass
 

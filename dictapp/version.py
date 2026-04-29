@@ -1,64 +1,52 @@
 APP_NAME = "DictarApp"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 WHATS_NEW = {
     "version": VERSION,
-    "title": "DictarApp 0.4 — recargado",
-    "tagline": "Más rápido, más seguro, ahora también offline.",
+    "title": "DictarApp 0.5 — selector de mic limpio y feedback en vivo",
+    "tagline": "Un mic, una barra que se mueve, un icono que respira.",
     "sections": [
         {
             "icon": "*",
-            "title": "Whisper local (offline)",
+            "title": "Selección de micrófono simplificada",
             "items": [
-                "Nuevo backend con faster-whisper: dicta sin internet y sin enviar audio a la nube.",
-                "Modelos seleccionables: tiny / base / small / medium / large-v3.",
-                "Auto-detecta CUDA si tienes GPU NVIDIA; cae a CPU con int8 si no.",
-            ],
-        },
-        {
-            "icon": "#",
-            "title": "Claves seguras",
-            "items": [
-                "La API key de Groq ya no vive en texto plano en el registro.",
-                "Ahora se guarda con keyring (DPAPI en Windows) y se migra automáticamente la primera vez.",
-                "Se mantiene un settings.json para preferencias no sensibles.",
+                "Auto-asigna el mic default del sistema (el que toma cualquier app).",
+                "Combobox con alternativas curadas: solo WASAPI (o MME si no hay), sin duplicados de host APIs.",
+                "Una sola fila con dot de voz + nombre + barra de nivel en vivo.",
             ],
         },
         {
             "icon": "+",
-            "title": "Audio mejorado",
+            "title": "Indicador de voz en tiempo real",
             "items": [
-                "Selector de micrófono en vivo (no más 'Desconocido').",
-                "Recorte de silencios al inicio/final.",
-                "Restaura tu portapapeles después del autopaste.",
-                "Logging thread-safe (sin congelar la UI).",
-            ],
-        },
-        {
-            "icon": ">",
-            "title": "UI nueva",
-            "items": [
-                "Tema oscuro con ttk, tipografía legible, layout en pestañas.",
-                "Hotkey configurable desde la UI (default Ctrl+Alt+N).",
-                "Indicadores de estado más claros (idle / grabando / transcribiendo / OK / error).",
-                "Modo compacto con un click, siempre encima.",
+                "VU meter continuo (single-stream) en lugar del scanner round-robin congelado.",
+                "Mientras grabás, la barra sigue moviéndose con tu voz.",
+                "El icono del tray pulsa: anillo rojo + disco interno que crece con el nivel.",
             ],
         },
         {
             "icon": "?",
+            "title": "Diagnóstico mejorado",
+            "items": [
+                "La ventana de log se abre automáticamente con trazas detalladas (REC / TX / DELIVER).",
+                "Botón 'Copiar todo' para mandar el log completo al portapapeles.",
+                "Tracebacks completos en errores de transcripción.",
+            ],
+        },
+        {
+            "icon": ">",
             "title": "Robustez",
             "items": [
-                "Limpieza segura de archivos temporales.",
-                "Manejo correcto de errores de Groq, Google y modelo local.",
-                "Hotkey global no se pisa con la tecla de pegado.",
+                "trim_silence ahora es adaptativo (15% del pico real) y respeta el sample rate del recorder.",
+                "Auto-fallback CUDA → CPU si faltan las DLLs de cuBLAS/cuDNN.",
+                "Safety net: si trim_silence dejaría < 25% del audio, devuelve el original.",
             ],
         },
     ],
     "try_this": [
-        "1. Abre Configuración -> pega tu Groq API Key (se cifra al guardar).",
-        "2. Cambia el backend a 'Whisper local' y elige modelo 'base'. Espera a que descargue (1ra vez).",
-        "3. Pon el cursor en cualquier app, presiona Ctrl+Alt+N, dicta, vuelve a presionar.",
-        "4. Activa 'Modo compacto' y 'Siempre encima' para usarlo flotando.",
-        "5. Si tienes GPU NVIDIA, en Configuración fuerza device='cuda' y usa modelo 'medium'.",
+        "1. Abrí la app: el mic default ya está asignado y la barra se mueve al hablar.",
+        "2. Si querés cambiar de mic, usá el combobox 'Cambiar:' (solo mics reales, sin duplicados).",
+        "3. Presioná Ctrl+Alt+N para grabar — la barra y el icono del tray reaccionan a tu voz.",
+        "4. Si algo falla, abrí el log y mandá 'Copiar todo'.",
     ],
 }

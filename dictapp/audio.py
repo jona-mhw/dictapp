@@ -101,6 +101,53 @@ def get_default_mic_name() -> str:
         p.terminate()
 
 
+# Prioridad de host API en Windows: WASAPI es lo que usan las apps modernas en
+# shared mode; MME es el legacy de fallback. DirectSound y WDM-KS los
+# descartamos del UI porque casi siempre son duplicados ruidosos.
+_HOST_API_PRIORITY = {
+    "Windows WASAPI": 0,
+    "MME": 1,
+}
+
+
+def list_curated_input_devices() -> list[MicDevice]:
+    """Devuelve un mic por dispositivo físico, sin duplicados de host API.
+
+    Estrategia: preferir WASAPI; si no hay, caer a MME. Dedup por nombre.
+    El que queda marcado como default es el que Windows reporta como default
+    del sistema (lo mismo que toma cualquier app por defecto).
+    """
+    raw = list_input_devices()
+    if not raw:
+        return []
+    for preferred in ("Windows WASAPI", "MME"):
+        subset = [d for d in raw if d.host_api_name == preferred]
+        if subset:
+            seen: set[str] = set()
+            uniq: list[MicDevice] = []
+            for d in subset:
+                if d.name in seen:
+                    continue
+                seen.add(d.name)
+                uniq.append(d)
+            default_name = get_default_mic_name()
+            for d in uniq:
+                d.is_default = (d.name == default_name)
+            if not any(d.is_default for d in uniq):
+                uniq[0].is_default = True
+            uniq.sort(key=lambda x: (not x.is_default, x.name.lower()))
+            return uniq
+    # último recurso: lo que haya, dedup por nombre
+    seen2: set[str] = set()
+    out: list[MicDevice] = []
+    for d in raw:
+        if d.name in seen2:
+            continue
+        seen2.add(d.name)
+        out.append(d)
+    return out
+
+
 class AudioRecorder:
     """Grabador push-to-toggle. Acumula PCM en memoria hasta stop()."""
 
@@ -112,6 +159,7 @@ class AudioRecorder:
         self._thread: threading.Thread | None = None
         self._error: str | None = None
         self._sample_rate_used: int = SAMPLE_RATE
+        self._level: float = 0.0
 
     @property
     def recording(self) -> bool:
@@ -124,6 +172,10 @@ class AudioRecorder:
     @property
     def sample_rate(self) -> int:
         return self._sample_rate_used
+
+    @property
+    def level(self) -> float:
+        return self._level
 
     def start(self) -> None:
         if self._recording:
@@ -242,20 +294,30 @@ class AudioRecorder:
                 )
                 return
 
+            import audioop
             while self._recording:
                 try:
                     data = stream.read(CHUNK, exception_on_overflow=False)
                     if captured_channels > 1:
-                        # mezclar a mono
                         try:
-                            import audioop
                             data = audioop.tomono(data, SAMPLE_WIDTH, 0.5, 0.5)
                         except Exception:
                             pass
                     self._frames.append(data)
+                    try:
+                        rms = audioop.rms(data, SAMPLE_WIDTH)
+                        new_lvl = min(1.0, rms / 4000.0)
+                        # subir rápido, bajar suave
+                        if new_lvl > self._level:
+                            self._level = new_lvl
+                        else:
+                            self._level = self._level * 0.78 + new_lvl * 0.22
+                    except Exception:
+                        pass
                 except Exception as e:
                     self._error = f"Error durante grabación: {self._describe_error(e)}"
                     break
+            self._level = 0.0
         except Exception as e:
             self._error = f"No se pudo abrir el micrófono: {self._describe_error(e)}"
         finally:
@@ -268,16 +330,36 @@ class AudioRecorder:
             p.terminate()
 
 
-def trim_silence(pcm: bytes, threshold: int = 500, sample_width: int = SAMPLE_WIDTH) -> bytes:
-    """Recorta silencios al inicio y al final basándose en amplitud absoluta."""
+def trim_silence(pcm: bytes, threshold: int | None = None,
+                 sample_width: int = SAMPLE_WIDTH,
+                 sample_rate: int = SAMPLE_RATE) -> bytes:
+    """Recorta silencios al inicio y al final basándose en amplitud relativa.
+
+    Si `threshold` es None, calcula uno adaptativo según el pico de la grabación
+    (15% del RMS máximo, con piso 120). Esto evita comerse audio en mics
+    silenciosos donde un threshold fijo es demasiado alto.
+    """
     if not pcm or sample_width != 2:
         return pcm
     import audioop
     try:
-        # ventana 50 ms
-        win = int(SAMPLE_RATE * 0.05) * sample_width
+        # ventana 50 ms al sample rate REAL
+        win = int(sample_rate * 0.05) * sample_width
         if win <= 0 or win > len(pcm):
             return pcm
+        # threshold adaptativo: 15% del pico, mínimo 120
+        if threshold is None:
+            peak = 0
+            scan_pos = 0
+            while scan_pos + win <= len(pcm):
+                rms_v = audioop.rms(pcm[scan_pos:scan_pos + win], sample_width)
+                if rms_v > peak:
+                    peak = rms_v
+                scan_pos += win
+            threshold = max(120, int(peak * 0.15))
+            # si el pico es realmente bajo, no recortes nada (mic silencioso)
+            if peak < 200:
+                return pcm
         start = 0
         end = len(pcm)
         while start + win <= end:
@@ -288,10 +370,13 @@ def trim_silence(pcm: bytes, threshold: int = 500, sample_width: int = SAMPLE_WI
             if audioop.rms(pcm[end - win:end], sample_width) > threshold:
                 break
             end -= win
-        # padding 100 ms a cada lado para no cortar consonantes
-        pad = int(SAMPLE_RATE * 0.1) * sample_width
+        # padding 200 ms a cada lado para no cortar consonantes
+        pad = int(sample_rate * 0.2) * sample_width
         start = max(0, start - pad)
         end = min(len(pcm), end + pad)
+        # safety: si quedaría < 25% del original, mejor devolver el original
+        if (end - start) < len(pcm) * 0.25:
+            return pcm
         return pcm[start:end] if end > start else pcm
     except Exception:
         return pcm

@@ -4,12 +4,13 @@ from __future__ import annotations
 import threading
 import time
 import tkinter as tk
+import traceback
 
 import pyperclip
 
 from . import audio as audio_mod
 from . import whats_new
-from .audio_sd import SDRecorder, SDMeterScanner, SD_AVAILABLE
+from .audio_sd import SDRecorder, SD_AVAILABLE
 from .audio_ffmpeg import (
     FFmpegRecorder,
     FFMPEG_AVAILABLE,
@@ -61,6 +62,7 @@ class App:
             )
         # qué backend está activo (alterna a sd / ffmpeg si pyaudio falla)
         self._backend: str = "pyaudio"  # "pyaudio" | "sd" | "ffmpeg"
+        self._tray_level_after: str | None = None  # id del callback root.after para detenerlo
         self.hotkey = HotkeyManager()
 
         # transcribers
@@ -70,6 +72,7 @@ class App:
             model_size=self.config.get("local_model"),
             device=self.config.get("local_device"),
             compute_type=self.config.get("local_compute_type"),
+            log_fn=lambda m: self._log(m),
         )
 
         # log window flotante
@@ -110,6 +113,16 @@ class App:
         # popup what's new si versión cambió
         if whats_new.should_show(self.config.get("last_seen_version", "")):
             self.root.after(250, self._show_whats_new)
+
+        # abrir el log automáticamente para diagnóstico
+        self.root.after(120, self._open_log_at_start)
+
+    def _open_log_at_start(self) -> None:
+        try:
+            self.log_window.open()
+            self.window.log_btn.config(text="Ocultar log")
+        except Exception as e:
+            self._log(f"No se pudo abrir log automáticamente: {e}")
 
     # ---------------------------------------------------------- logging
     def _log(self, message: str) -> None:
@@ -337,12 +350,15 @@ class App:
 
     def start_recording(self) -> None:
         t = self._current_transcriber()
+        self.window.log(f"[REC] toggle ON · servicio={t.name} · mic_index={self.config.get('mic_index')} · hotkey={self.config.get('hotkey')}")
         ok, msg = t.is_ready()
+        self.window.log(f"[REC] is_ready -> {ok} · {msg}")
         if not ok:
             self.window.log(f"No se puede grabar: {msg}")
             self.window.set_status(f"Error: {msg}", color="err")
             return
         self.window.stop_mic_meter()
+        self.window.log("[REC] VU meter detenido, esperando 250ms para liberar PortAudio…")
         time.sleep(0.25)
 
         result = self._try_start_chain()
@@ -364,26 +380,66 @@ class App:
         self.window.set_recording_button(True)
         self.window.set_status("Grabando…", color="err")
         self.tray.set_state("recording")
+        # barra de la UI lee del recorder mientras se graba
+        self.window.set_level_override(lambda r=rec: getattr(r, "level", 0.0))
+        # tick del tray según nivel
+        self._start_tray_level_ticker(rec)
         self.window.log(f"Grabación iniciada ({backend}).")
+
+    def _start_tray_level_ticker(self, rec) -> None:
+        if self._tray_level_after is not None:
+            try:
+                self.root.after_cancel(self._tray_level_after)
+            except Exception:
+                pass
+            self._tray_level_after = None
+
+        def tick():
+            if not getattr(rec, "recording", False):
+                self._tray_level_after = None
+                return
+            try:
+                self.tray.set_level(getattr(rec, "level", 0.0))
+            except Exception:
+                pass
+            self._tray_level_after = self.root.after(90, tick)
+
+        self._tray_level_after = self.root.after(0, tick)
+
+    def _stop_tray_level_ticker(self) -> None:
+        if self._tray_level_after is not None:
+            try:
+                self.root.after_cancel(self._tray_level_after)
+            except Exception:
+                pass
+            self._tray_level_after = None
 
     def stop_recording_and_transcribe(self) -> None:
         rec = self._active_recorder()
+        self.window.log(f"[REC] toggle OFF · backend activo={self._backend}")
         pcm = rec.stop()
+        self.window.log(f"[REC] stop() devolvió {len(pcm)} bytes de PCM crudo")
         self.window.set_recording_button(False)
+        # quitar override de nivel + ticker del tray
+        self.window.set_level_override(None)
+        self._stop_tray_level_ticker()
         # restaurar VU meters tras dar tiempo a PortAudio a liberar
         self.root.after(600, self.window.refresh_microphones)
         if rec.error:
-            self.window.log(rec.error)
+            self.window.log(f"[REC] error en recorder: {rec.error}")
         if not pcm:
+            self.window.log("[REC] PCM vacío — no hay nada que transcribir")
             self.window.set_status("Sin audio", color="warn")
             self.tray.set_state("idle")
             return
         rate = rec.sample_rate
         seconds = audio_mod.duration_seconds(pcm, sample_rate=rate)
-        self.window.log(f"Grabación detenida. {seconds:.1f}s capturados @ {rate} Hz.")
+        self.window.log(f"[REC] grabación: {seconds:.2f}s @ {rate} Hz · {len(pcm)} bytes")
 
         if self.config.get("trim_silence"):
-            pcm = audio_mod.trim_silence(pcm)
+            before = len(pcm)
+            pcm = audio_mod.trim_silence(pcm, sample_rate=rate)
+            self.window.log(f"[REC] trim_silence: {before} -> {len(pcm)} bytes ({audio_mod.duration_seconds(pcm, sample_rate=rate):.2f}s)")
 
         self.window.set_status("Transcribiendo…", color="warn")
         self.tray.set_state("transcribing")
@@ -391,22 +447,29 @@ class App:
 
     def _transcribe_worker(self, pcm: bytes, sample_rate: int) -> None:
         t = self._current_transcriber()
+        lang = self.config.get("language", "es")
+        self.window.log(f"[TX] backend='{t.name}' lang='{lang}' · iniciando…")
         try:
             with audio_mod.pcm_to_wav_temp(pcm, sample_rate=sample_rate) as wav_path:
-                result = t.transcribe(wav_path, language=self.config.get("language", "es"))
+                self.window.log(f"[TX] WAV temporal: {wav_path}")
+                t0 = time.perf_counter()
+                result = t.transcribe(wav_path, language=lang)
+                self.window.log(f"[TX] transcribe() OK en {time.perf_counter()-t0:.2f}s")
         except TranscriptionError as e:
-            self.window.log(f"Error: {e}")
+            tb = traceback.format_exc()
+            self.window.log(f"[TX] TranscriptionError: {e}\n{tb}")
             self.window.set_status("Error", color="err")
             self.tray.set_state("error")
             return
         except Exception as e:
-            self.window.log(f"Error inesperado: {e}")
+            tb = traceback.format_exc()
+            self.window.log(f"[TX] excepción inesperada ({type(e).__name__}): {e}\n{tb}")
             self.window.set_status("Error", color="err")
             self.tray.set_state("error")
             return
 
         text = self._format(result.text)
-        self.window.log(f"[{result.backend} · {result.seconds:.1f}s] {text}")
+        self.window.log(f"[TX] resultado ({result.backend} · {result.seconds:.2f}s · {len(text)} chars): {text!r}")
         self.root.after(0, self.log_window.log_transcript, text, result.backend, result.seconds)
         self._deliver(text)
         self.window.set_status(f"Listo ({result.seconds:.1f}s)", color="ok")
@@ -422,17 +485,24 @@ class App:
 
     def _deliver(self, text: str) -> None:
         if not text:
+            self.window.log("[DELIVER] texto vacío, nada que entregar")
             return
         try:
             pyperclip.copy(text)
+            self.window.log(f"[DELIVER] portapapeles ← {len(text)} chars")
         except Exception as e:
-            self.window.log(f"No se pudo copiar al portapapeles: {e}")
+            tb = traceback.format_exc()
+            self.window.log(f"[DELIVER] no se pudo copiar: {e}\n{tb}")
             return
         if self.config.get("auto_paste"):
             try:
                 self.hotkey.send_paste()
+                self.window.log("[DELIVER] auto-paste enviado (Ctrl+V)")
             except Exception as e:
-                self.window.log(f"No se pudo auto-pegar: {e}")
+                tb = traceback.format_exc()
+                self.window.log(f"[DELIVER] no se pudo auto-pegar: {e}\n{tb}")
+        else:
+            self.window.log("[DELIVER] auto-paste desactivado, solo copiado al portapapeles")
 
     # ---------------------------------------------------------- ciclo de vida
     def on_window_close(self) -> None:

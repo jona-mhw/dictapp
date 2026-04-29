@@ -71,8 +71,10 @@ class LogWindow:
         # botón limpiar
         bottom = ttk.Frame(win, style="TFrame")
         bottom.pack(fill=tk.X, padx=10, pady=(0, 10))
-        ttk.Button(bottom, text="Limpiar eventos", command=self.clear_events
+        ttk.Button(bottom, text="Copiar todo", command=self.copy_all
                    ).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Limpiar eventos", command=self.clear_events
+                   ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bottom, text="Limpiar transcripciones", command=self.clear_transcripts
                    ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bottom, text="Cerrar", command=self.close
@@ -101,6 +103,23 @@ class LogWindow:
         self._transcripts_buffer.append(block)
         if self.transcripts_widget is not None:
             self._append(self.transcripts_widget, block, newline=False)
+
+    def copy_all(self) -> None:
+        """Copia eventos + transcripciones al portapapeles para diagnóstico."""
+        parts: list[str] = []
+        if self._events_buffer:
+            parts.append("===== EVENTOS =====")
+            parts.extend(self._events_buffer)
+        if self._transcripts_buffer:
+            parts.append("\n===== TRANSCRIPCIONES =====")
+            parts.extend(self._transcripts_buffer)
+        text = "\n".join(parts)
+        try:
+            self.parent.clipboard_clear()
+            self.parent.clipboard_append(text)
+            self.parent.update()
+        except Exception:
+            pass
 
     def clear_events(self) -> None:
         self._events_buffer.clear()
