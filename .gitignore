@@ -16,3 +16,6 @@ test_*.wav
 # IDE
 .vscode/
 .idea/
+
+# Auxiliar de sesion (mhw-repo)
+_mhw-session-context.md
